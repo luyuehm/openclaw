@@ -27,7 +27,6 @@ minimumReleaseAgeExclude:
   - "@rolldown/*"
   - "@oxlint/*"
   - "@oxfmt/*"
-  - "axios@1.15.0"
   - "discord-api-types"
   - "rolldown"
   - "sqlite-vec"
@@ -50,7 +49,7 @@ overrides:
   # --- Existing pins (migrated from package.json pnpm.overrides) ---
   "@anthropic-ai/sdk": "0.91.0"
   "@hono/node-server": "1.19.14"
-  axios: "1.15.0"
+  axios: "1.18.0"
   "follow-redirects": "1.16.0"
   defu: "6.1.5"
   "fast-xml-parser": "5.7.0"
@@ -64,8 +63,10 @@ overrides:
   typebox: "1.1.32"
   tough-cookie: "4.1.3"
   yauzl: "3.2.1"
-  protobufjs: "7.5.5"
+  protobufjs: "7.6.1"
   uuid: "14.0.0"
+  # --- Extension chain SCA fixes (RIC-761) ---
+  "@grpc/grpc-js": "1.14.4"
 
 onlyBuiltDependencies:
   - "@lydell/node-pty"
@@ -90,6 +91,3 @@ packageExtensions:
 peerDependencyRules:
   allowedVersions:
     "prism-media>opusscript": "^0.0.8 || ^0.1.1"
-
-patchedDependencies:
-  "@whiskeysockets/baileys@7.0.0-rc.9": "patches/@whiskeysockets__baileys@7.0.0-rc.9.patch"

@@ -48,7 +48,7 @@ async function loadSharp(maxInputPixels: number): Promise<SharpFactory> {
         return ((buffer, options) =>
           sharp(buffer, {
             ...options,
-            failOnError: false,
+            failOn: "none",
             limitInputPixels: maxInputPixels,
           })) as SharpFactory;
       })

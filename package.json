@@ -1680,7 +1680,7 @@
     "vitest": "^4.1.5"
   },
   "overrides": {
-    "axios": "1.15.0",
+    "axios": "1.18.0",
     "follow-redirects": "1.16.0",
     "node-domexception": "npm:@nolyfill/domexception@1.0.28",
     "uuid": "14.0.0"
