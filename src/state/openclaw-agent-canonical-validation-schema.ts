@@ -105,3 +105,52 @@ export function withoutCanonicalSessionValidationSchema(schema: string): string 
   }
   return schema.replace(canonicalSessionValidationSchemaSql(schema), "");
 }
+
+/**
+ * The canonical pending triggers are applied with CREATE TRIGGER IF NOT EXISTS,
+ * which is a no-op when a same-name trigger already exists. A drifted trigger
+ * definition therefore survives a plain `db.exec(schemaSql)` replay and trips the
+ * strict schema admission. Rebuild each canonical pending trigger idempotently by
+ * dropping and recreating it from the canonical schema before admission asserts.
+ */
+export function repairCanonicalSessionValidationTriggers(
+  database: DatabaseSync,
+  schema = OPENCLAW_AGENT_SCHEMA_SQL,
+): void {
+  // Keep this set in sync with the trigger names asserted by assertCanonicalSessionValidationSchema.
+  for (const name of CANONICAL_PENDING_TRIGGER_NAMES) {
+    // sqlite-allow-raw -- Rebuild a drifted canonical trigger definition before admission.
+    database.exec(`DROP TRIGGER IF EXISTS main.${name};`);
+    const ddl = extractCanonicalPendingTriggerDdl(schema, name);
+    if (!ddl) {
+      throw new Error(`Canonical session validation trigger is missing from schema: ${name}`);
+    }
+    database.exec(ddl);
+  }
+}
+
+const CANONICAL_PENDING_TRIGGER_NAMES = [
+  "session_nodes_canonical_pending_after_insert",
+  "session_nodes_canonical_pending_after_update",
+  "session_nodes_canonical_pending_after_delete",
+  "session_windows_canonical_pending_after_insert",
+  "session_windows_canonical_pending_after_update",
+  "session_windows_canonical_pending_after_delete",
+  "session_key_contract_canonical_pending_after_insert",
+  "session_key_contract_canonical_pending_after_update",
+  "session_key_contract_canonical_pending_after_delete",
+] as const;
+
+function extractCanonicalPendingTriggerDdl(schema: string, name: string): string | undefined {
+  const marker = `CREATE TRIGGER IF NOT EXISTS ${name}`;
+  const start = schema.indexOf(marker);
+  if (start < 0) {
+    return undefined;
+  }
+  // Triggers terminate at the END; keyword that closes the trigger body.
+  const endKeyword = schema.indexOf("END;", start);
+  if (endKeyword < 0) {
+    return undefined;
+  }
+  return schema.slice(start, endKeyword + "END;".length);
+}

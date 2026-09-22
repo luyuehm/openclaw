@@ -30,6 +30,7 @@ import { normalizeAgentId } from "../routing/session-key.js";
 import { ensureOpenClawAgentBoardSchemaInTransaction } from "./openclaw-agent-board-schema.js";
 import {
   canonicalSessionValidationSchemaSql,
+  repairCanonicalSessionValidationTriggers,
   withoutCanonicalSessionValidationSchema,
 } from "./openclaw-agent-canonical-validation-schema.js";
 import {
@@ -557,6 +558,7 @@ function ensureAgentSchema(
           previousSchema,
         );
         db.exec(canonicalSessionValidationSchemaSql(schemaSql));
+        repairCanonicalSessionValidationTriggers(db, schemaSql);
         seedCanonicalSessionValidationPending(db);
         db.exec(`PRAGMA user_version = ${targetVersion};`);
         persistAgentSchemaMetadata(db, agentId, targetVersion);
@@ -585,6 +587,11 @@ function ensureAgentSchema(
         if (hasPendingMemoryChunkMetadataMigration(db)) {
           migrateMemoryChunkMetadataSchema(db);
           db.exec(schemaSql);
+        }
+        // Rebuild drifted canonical pending triggers before admission asserts
+        // them: CREATE TRIGGER IF NOT EXISTS cannot replace a drifted definition.
+        if (targetVersion >= CANONICAL_SESSION_VALIDATION_SCHEMA_VERSION) {
+          repairCanonicalSessionValidationTriggers(db, schemaSql);
         }
         // Repeat index repair before the transactional schema assertion so a
         // concurrent opener cannot turn repairable drift into a hard refusal.
@@ -640,6 +647,9 @@ function ensureAgentSchema(
         targetVersion >= CANONICAL_SESSION_VALIDATION_SCHEMA_VERSION
       ) {
         seedCanonicalSessionValidationPending(db);
+      }
+      if (targetVersion >= CANONICAL_SESSION_VALIDATION_SCHEMA_VERSION) {
+        repairCanonicalSessionValidationTriggers(db, schemaSql);
       }
       repairCanonicalSqliteIndexes(db, pathname, schemaSql, {
         verifyPhysicalIntegrity: false,

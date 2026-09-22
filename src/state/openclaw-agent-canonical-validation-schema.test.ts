@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import { withOpenClawTestState } from "../test-utils/openclaw-test-state.js";
 import {
   assertCanonicalSessionValidationSchema,
+  repairCanonicalSessionValidationTriggers,
   withoutCanonicalSessionValidationSchema,
 } from "./openclaw-agent-canonical-validation-schema.js";
 import { CANONICAL_SESSION_VALIDATION_SCHEMA_VERSION } from "./openclaw-agent-db-contract.js";
@@ -267,6 +268,34 @@ describe("canonical validation schema admission", () => {
       });
     },
   );
+});
+
+describe("canonical validation trigger repair", () => {
+  it("rebuilds a drifted canonical pending trigger so admission succeeds", () => {
+    withDatabase((database) => {
+      assertCanonicalSessionValidationSchema(database);
+      // Simulate a drifted trigger that survived a CREATE TRIGGER IF NOT EXISTS
+      // replay: drop the canonical update trigger and install a wrong body.
+      database.exec("DROP TRIGGER session_nodes_canonical_pending_after_update");
+      database.exec(`CREATE TRIGGER session_nodes_canonical_pending_after_update
+        AFTER UPDATE OF entry_json ON session_nodes BEGIN
+          DELETE FROM session_canonical_validation_pending;
+        END`);
+      expect(() => assertCanonicalSessionValidationSchema(database)).toThrow(/missing or drifted/u);
+      repairCanonicalSessionValidationTriggers(database);
+      // Admission now passes and the canonical trigger behavior is restored.
+      expect(() => assertCanonicalSessionValidationSchema(database)).not.toThrow();
+      insertNode(database, key, "target");
+      clearPending(database);
+      // The rebuilt trigger re-pends on a lineage change, not on entry_json.
+      database.prepare("UPDATE session_nodes SET entry_valid = 1 WHERE session_key = ?").run(key);
+      expect(pendingKeys(database)).toEqual([]);
+      database
+        .prepare("UPDATE session_nodes SET parent_session_key = ? WHERE session_key = ?")
+        .run(sibling, key);
+      expect(pendingKeys(database)).toEqual([key]);
+    });
+  });
 });
 
 describe("agent schema 21 migration", () => {

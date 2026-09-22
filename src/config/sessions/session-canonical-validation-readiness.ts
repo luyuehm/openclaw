@@ -30,6 +30,13 @@ import { hasPendingCanonicalSessionValidation } from "./session-canonical-valida
 const MAX_BATCH_ROWS = 128;
 const MAX_BATCH_BYTES = 1024 * 1024;
 const CONTENTION_BACKOFF_MS = [0, 25, 100, 250] as const;
+// Active sessions keep producing pending rows between the read and write
+// halves of a certify batch; allow a bounded number of stalled batches before
+// publishing canonical readiness for the rows already settled this turn. The
+// remaining pending markers stay for the next request or startup to drain
+// incrementally. This preserves the consistency check without blocking the
+// request path on sessions that are actively being written to.
+const MAX_STALLED_BATCHES = 4;
 const log = createSubsystemLogger("sessions/canonical-validation");
 
 /** Certify dirty persisted rows before startup maintenance reads their full entries. */
@@ -155,8 +162,23 @@ export async function certifySessionCanonicalValidationPending(
               continue;
             }
             if (result.certifiedRows === 0) {
-              const waitMs = CONTENTION_BACKOFF_MS[contendedBatches] ?? 250;
-              contendedBatches = Math.min(contendedBatches + 1, CONTENTION_BACKOFF_MS.length - 1);
+              contendedBatches += 1;
+              if (contendedBatches >= MAX_STALLED_BATCHES) {
+                // The batch's committed certification has settled whatever was
+                // stable between the read and write halves; rows that keep
+                // changing under an active writer remain pending for the next
+                // request or startup to drain incrementally. Publish readiness
+                // so the request path stops re-entering this drain on every
+                // read/mutate instead of holding it open indefinitely.
+                if (
+                  !isOpenClawAgentDatabasePathCurrent(database) ||
+                  !markOpenClawAgentCanonicalValidation(database)
+                ) {
+                  throw new Error("SQLite session reclamation database owner is no longer current");
+                }
+                return;
+              }
+              const waitMs = CONTENTION_BACKOFF_MS[contendedBatches - 1] ?? 250;
               await delay(waitMs);
             } else {
               contendedBatches = 0;

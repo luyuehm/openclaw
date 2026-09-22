@@ -181,12 +181,18 @@ BEGIN
   );
 END;
 
+-- entry_json is the canonical logical-session record body. High-frequency
+-- content edits (tool calls, prompt bytes) flip it without touching canonical
+-- lineage or admission keys; only lineage/identity column changes need to bring
+-- a row back for canonical recertification. The separate
+-- session_nodes_entry_valid_after_entry_update trigger already clears
+-- entry_valid on every entry_json write, so admission is preserved without
+-- re-pending the whole canonical batch for an active writer.
 CREATE TRIGGER IF NOT EXISTS session_nodes_canonical_pending_after_update
-AFTER UPDATE OF session_key, current_session_id, entry_json, entry_valid,
+AFTER UPDATE OF session_key, current_session_id, entry_valid,
   parent_session_key, spawned_by, fork_source_session_key ON session_nodes
 WHEN OLD.session_key IS NOT NEW.session_key
   OR OLD.current_session_id IS NOT NEW.current_session_id
-  OR OLD.entry_json IS NOT NEW.entry_json
   OR OLD.entry_valid IS NOT NEW.entry_valid
   OR OLD.parent_session_key IS NOT NEW.parent_session_key
   OR OLD.spawned_by IS NOT NEW.spawned_by

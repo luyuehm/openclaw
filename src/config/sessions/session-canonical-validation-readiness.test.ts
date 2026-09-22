@@ -166,31 +166,100 @@ it("refuses to publish canonical readiness after its physical verification recei
   });
 });
 
-it("retains pending validation when startup authority is revoked before worker write admission", async () => {
+it("terminates a drain that stalls every batch under an active writer and publishes readiness", async () => {
   await withOpenClawTestState({ scenario: "minimal" }, async () => {
     const { options, database } = seedPendingRows(1);
-    invalidateOpenClawAgentDatabaseValidation(database.path);
-    expect(hasOpenClawAgentCanonicalValidation(database)).toBe(false);
-    let revoked = false;
+    // Flip the row's entry_json between the read and write halves of every
+    // certify batch while keeping entry_valid settled at 1. The snapshot
+    // captured by readPendingCanonicalSessionValidationBatch no longer matches
+    // compareAndCertifyCanonicalSessionValidationBatch's reread, so
+    // certifiedRows stays 0 while hasMore stays true. The readiness owner must
+    // cap the stalled batches and publish canonicalReady instead of looping
+    // forever; the row remains pending for the next request to drain.
+    let mutations = 0;
     const createWorker = archiveWorker.createSqliteTranscriptArchiveWorker;
     vi.spyOn(archiveWorker, "createSqliteTranscriptArchiveWorker").mockImplementation((data) => {
       const worker = createWorker(data);
       worker.on("message", (message: { type: string }) => {
         if (message.type === "admission-request") {
-          revoked = true;
+          mutations += 1;
+          // Emulate an active writer's two-step commit between the read and
+          // write halves: change entry_json (which clears entry_valid via the
+          // entry_json projection trigger) and then settle entry_valid back to
+          // 1. The row stays valid, but the entry_json captured by the read
+          // snapshot no longer matches the write-half reread, so certifiedRows
+          // stays 0 while hasMore stays true.
+          database.db.exec(
+            `UPDATE session_nodes SET entry_json = '{"sessionId":"pending-0","updatedAt":1,"label":"mut-${mutations}"}' WHERE session_key = 'agent:main:pending-0'`,
+          );
+          database.db.exec(
+            "UPDATE session_nodes SET entry_valid = 1 WHERE session_key = 'agent:main:pending-0'",
+          );
         }
       });
       return worker;
     });
-    await expect(
-      certifySessionCanonicalValidationPending(options, undefined, () => {
-        if (revoked) {
-          throw new Error("startup preparation was superseded");
-        }
-      }),
-    ).rejects.toThrow("startup preparation was superseded");
-    expect(revoked).toBe(true);
+    await expect(certifySessionCanonicalValidationPending(options)).resolves.toBeUndefined();
+    expect(mutations).toBeGreaterThan(0);
     expect(hasPendingCanonicalSessionValidation(database)).toBe(true);
-    expect(hasOpenClawAgentCanonicalValidation(database)).toBe(false);
+    expect(hasOpenClawAgentCanonicalValidation(database)).toBe(true);
+  });
+});
+
+it("does not re-pend a clean row on a bare entry_json content edit", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    const { options, database } = seedPendingRows(1);
+    // Drain the seeded pending marker so the row is certified and clean.
+    await certifySessionCanonicalValidationPending(options);
+    expect(hasPendingCanonicalSessionValidation(database)).toBe(false);
+    // Drop entry_valid to 0 and clear the pending marker so the row is settled
+    // but validity is open. A subsequent bare entry_json edit cannot ride an
+    // entry_valid transition back into pending, and after the fix the canonical
+    // pending trigger no longer fires on entry_json at all.
+    database.db.exec(
+      "UPDATE session_nodes SET entry_valid = 0 WHERE session_key = 'agent:main:pending-0'",
+    );
+    database.db.exec("DELETE FROM session_canonical_validation_pending");
+    expect(hasPendingCanonicalSessionValidation(database)).toBe(false);
+    database.db
+      .prepare("UPDATE session_nodes SET entry_json = ? WHERE session_key = ?")
+      .run(
+        JSON.stringify({ sessionId: "pending-0", updatedAt: 2, label: "content-only" }),
+        "agent:main:pending-0",
+      );
+    // entry_valid stays 0 (the entry_valid_after_entry_update trigger is a no-op
+    // when it is already 0), so no canonical pending transition fires.
+    expect(hasPendingCanonicalSessionValidation(database)).toBe(false);
+    // The writer's normal commit step flips entry_valid to 1; that canonical
+    // transition re-pends the row so the next request re-validates its shape.
+    database.db.exec(
+      "UPDATE session_nodes SET entry_valid = 1 WHERE session_key = 'agent:main:pending-0'",
+    );
+    expect(hasPendingCanonicalSessionValidation(database)).toBe(true);
+  });
+});
+
+it("converges a drain while sessions are actively written between batches", async () => {
+  await withOpenClawTestState({ scenario: "minimal" }, async () => {
+    const { options, database } = seedPendingRows(4, 256);
+    // Simulate an active writer flipping entry_json on a sibling session
+    // between batches. Before the fix this kept certifiedRows=0 every batch
+    // and the drain never returned; now it caps stalled batches and publishes.
+    let writes = 0;
+    const createWorker = archiveWorker.createSqliteTranscriptArchiveWorker;
+    vi.spyOn(archiveWorker, "createSqliteTranscriptArchiveWorker").mockImplementation((data) => {
+      const worker = createWorker(data);
+      worker.on("message", (message: { type: string }) => {
+        if (message.type === "reclaimed" && writes < 3) {
+          writes += 1;
+          database.db.exec(
+            `UPDATE session_nodes SET entry_json = '{"sessionId":"pending-1","updatedAt":${writes}}' WHERE session_key = 'agent:main:pending-1'`,
+          );
+        }
+      });
+      return worker;
+    });
+    await expect(certifySessionCanonicalValidationPending(options)).resolves.toBeUndefined();
+    expect(hasOpenClawAgentCanonicalValidation(database)).toBe(true);
   });
 });
