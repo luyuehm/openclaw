@@ -4,10 +4,15 @@ const mocks = vi.hoisted(() => ({
   resolveMemorySearchConfig: vi.fn(),
   getMemorySearchManager: vi.fn(),
   resolveSharedMemoryStatusSnapshot: vi.fn(),
+  setConsoleSubsystemFilter: vi.fn(),
 }));
 
 vi.mock("../agents/memory-search.js", () => ({
   resolveMemorySearchConfig: mocks.resolveMemorySearchConfig,
+}));
+
+vi.mock("../logging/console.js", () => ({
+  setConsoleSubsystemFilter: mocks.setConsoleSubsystemFilter,
 }));
 
 vi.mock("./status.scan.deps.runtime.js", () => ({
@@ -17,6 +22,25 @@ vi.mock("./status.scan.deps.runtime.js", () => ({
 vi.mock("./status.scan.shared.js", () => ({
   resolveSharedMemoryStatusSnapshot: mocks.resolveSharedMemoryStatusSnapshot,
 }));
+
+function createMainAgentStatus() {
+  return {
+    defaultId: "main",
+    totalSessions: 0,
+    bootstrapPendingCount: 0,
+    agents: [
+      {
+        id: "main",
+        workspaceDir: null,
+        bootstrapPending: false,
+        sessionsPath: "/tmp/main.json",
+        sessionsCount: 0,
+        lastUpdatedAt: null,
+        lastActiveAgeMs: null,
+      },
+    ],
+  };
+}
 
 describe("status.scan-memory", () => {
   beforeEach(() => {
@@ -28,46 +52,21 @@ describe("status.scan-memory", () => {
     const { resolveStatusMemoryStatusSnapshot } = await import("./status.scan-memory.ts");
 
     const requireDefaultStore = vi.fn((agentId: string) => `/tmp/${agentId}.sqlite`);
+    const agentStatus = createMainAgentStatus();
     await resolveStatusMemoryStatusSnapshot({
       cfg: { agents: {} },
-      agentStatus: {
-        defaultId: "main",
-        totalSessions: 0,
-        bootstrapPendingCount: 0,
-        agents: [
-          {
-            id: "main",
-            workspaceDir: null,
-            bootstrapPending: false,
-            sessionsPath: "/tmp/main.json",
-            sessionsCount: 0,
-            lastUpdatedAt: null,
-            lastActiveAgeMs: null,
-          },
-        ],
-      },
+      agentStatus,
       memoryPlugin: { enabled: true, slot: "memory-core" },
       requireDefaultStore,
     });
 
+    expect(mocks.setConsoleSubsystemFilter).toHaveBeenNthCalledWith(1, [
+      "__openclaw_status_json_memory_probe_quiet__",
+    ]);
+    expect(mocks.setConsoleSubsystemFilter).toHaveBeenLastCalledWith(null);
     expect(mocks.resolveSharedMemoryStatusSnapshot).toHaveBeenCalledWith({
       cfg: { agents: {} },
-      agentStatus: {
-        defaultId: "main",
-        totalSessions: 0,
-        bootstrapPendingCount: 0,
-        agents: [
-          {
-            id: "main",
-            workspaceDir: null,
-            bootstrapPending: false,
-            sessionsPath: "/tmp/main.json",
-            sessionsCount: 0,
-            lastUpdatedAt: null,
-            lastActiveAgeMs: null,
-          },
-        ],
-      },
+      agentStatus,
       memoryPlugin: { enabled: true, slot: "memory-core" },
       resolveMemoryConfig: mocks.resolveMemorySearchConfig,
       getMemorySearchManager: mocks.getMemorySearchManager,

@@ -9,7 +9,7 @@ import type {
   AgentModelConfig,
   AgentSandboxConfig,
 } from "./types.agents-shared.js";
-import type { HumanDelayConfig, IdentityConfig } from "./types.base.js";
+import type { DmScope, HumanDelayConfig, IdentityConfig } from "./types.base.js";
 import type { GroupChatConfig } from "./types.messages.js";
 import type { SkillsLimitsConfig } from "./types.skills.js";
 import type { AgentToolsConfig, MemorySearchConfig } from "./types.tools.js";
@@ -50,6 +50,10 @@ export type AgentRouteBinding = {
   agentId: string;
   comment?: string;
   match: AgentBindingMatch;
+  session?: {
+    /** Optional session scoping override for conversations matched by this binding. */
+    dmScope?: DmScope;
+  };
 };
 
 export type AgentAcpBinding = {
@@ -79,7 +83,7 @@ export type AgentConfig = {
   embeddedHarness?: AgentEmbeddedHarnessConfig;
   model?: AgentModelConfig;
   /** Optional per-agent default thinking level (overrides agents.defaults.thinkingDefault). */
-  thinkingDefault?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "adaptive";
+  thinkingDefault?: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "adaptive" | "max";
   /** Optional per-agent default verbosity level. */
   verboseDefault?: "off" | "on" | "full";
   /** Optional per-agent default reasoning visibility. */
@@ -95,6 +99,7 @@ export type AgentConfig = {
   skillsLimits?: Pick<SkillsLimitsConfig, "maxSkillsPromptChars">;
   /** Optional per-agent overrides for selected context/token-heavy limits. */
   contextLimits?: AgentContextLimitsConfig;
+  contextTokens?: number;
   /** Optional per-agent heartbeat overrides. */
   heartbeat?: AgentDefaultsConfig["heartbeat"];
   identity?: IdentityConfig;

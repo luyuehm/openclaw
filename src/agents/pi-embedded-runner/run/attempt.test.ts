@@ -5,18 +5,26 @@ import { appendBootstrapPromptWarning } from "../../bootstrap-budget.js";
 import { SYSTEM_PROMPT_CACHE_BOUNDARY } from "../../system-prompt-cache-boundary.js";
 import { buildAgentSystemPrompt } from "../../system-prompt.js";
 import {
+  buildContextEnginePromptCacheInfo,
   buildAfterTurnRuntimeContext,
+  buildAfterTurnRuntimeContextFromUsage,
   composeSystemPromptWithHookContext,
   decodeHtmlEntitiesInObject,
+  applyEmbeddedAttemptToolsAllow,
+  isPrimaryBootstrapRun,
   mergeOrphanedTrailingUserPrompt,
+  normalizeMessagesForLlmBoundary,
   prependSystemPromptAddition,
+  remapInjectedContextFilesToWorkspace,
   resetEmbeddedAgentBaseStreamFnCacheForTest,
   resolveEmbeddedAgentBaseStreamFn,
   resolveAttemptFsWorkspaceOnly,
   resolveEmbeddedAgentStreamFn,
   resolveUnknownToolGuardThreshold,
+  shouldCreateBundleMcpRuntimeForAttempt,
   resolvePromptBuildHookResult,
   resolvePromptModeForSession,
+  shouldStripBootstrapFromEmbeddedContext,
   shouldWarnOnOrphanedUserRepair,
   wrapStreamFnRepairMalformedToolCallArguments,
   wrapStreamFnSanitizeMalformedToolCalls,
@@ -55,6 +63,68 @@ async function invokeWrappedTestStream(
   const wrappedFn = wrap(baseFn);
   return await Promise.resolve(wrappedFn({} as never, {} as never, {} as never));
 }
+
+describe("applyEmbeddedAttemptToolsAllow", () => {
+  it("keeps explicit toolsAllow authoritative after force-added tools are built", () => {
+    const tools = [{ name: "exec" }, { name: "read" }, { name: "message" }];
+
+    expect(
+      applyEmbeddedAttemptToolsAllow(tools, ["exec", "read"]).map((tool) => tool.name),
+    ).toEqual(["exec", "read"]);
+  });
+});
+
+describe("normalizeMessagesForLlmBoundary", () => {
+  it("strips tool result details before provider conversion", () => {
+    const input = [
+      {
+        role: "toolResult",
+        toolCallId: "call_1",
+        toolName: "exec",
+        content: [{ type: "text", text: "visible output" }],
+        details: { aggregated: "hidden diagnostics" },
+        isError: false,
+        timestamp: 1,
+      },
+    ];
+
+    const output = normalizeMessagesForLlmBoundary(
+      input as Parameters<typeof normalizeMessagesForLlmBoundary>[0],
+    ) as Array<Record<string, unknown>>;
+
+    expect(output[0]).not.toHaveProperty("details");
+    expect(output[0]?.content).toEqual([{ type: "text", text: "visible output" }]);
+    expect(input[0]).toHaveProperty("details");
+  });
+});
+
+describe("shouldCreateBundleMcpRuntimeForAttempt", () => {
+  it("skips bundle MCP when tools are disabled or unavailable", () => {
+    expect(shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: false })).toBe(false);
+    expect(shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: true, disableTools: true })).toBe(
+      false,
+    );
+  });
+
+  it("creates bundle MCP only when the allowlist can reach bundle MCP tool names", () => {
+    expect(shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: true })).toBe(true);
+    expect(shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: true, toolsAllow: [] })).toBe(
+      true,
+    );
+    expect(
+      shouldCreateBundleMcpRuntimeForAttempt({
+        toolsEnabled: true,
+        toolsAllow: ["memory_search", "memory_get"],
+      }),
+    ).toBe(false);
+    expect(
+      shouldCreateBundleMcpRuntimeForAttempt({
+        toolsEnabled: true,
+        toolsAllow: ["strict__strict_probe"],
+      }),
+    ).toBe(true);
+  });
+});
 
 describe("resolvePromptBuildHookResult", () => {
   function createLegacyOnlyHookRunner() {
@@ -218,6 +288,63 @@ describe("resolvePromptModeForSession", () => {
   });
 });
 
+describe("shouldStripBootstrapFromEmbeddedContext", () => {
+  it("never injects raw BOOTSTRAP.md into embedded system context", () => {
+    expect(shouldStripBootstrapFromEmbeddedContext({ bootstrapMode: "full" })).toBe(true);
+    expect(shouldStripBootstrapFromEmbeddedContext({ bootstrapMode: "limited" })).toBe(true);
+    expect(shouldStripBootstrapFromEmbeddedContext({ bootstrapMode: "none" })).toBe(true);
+  });
+});
+
+describe("isPrimaryBootstrapRun", () => {
+  it("treats regular sessions as primary bootstrap runs", () => {
+    expect(isPrimaryBootstrapRun("agent:main:main")).toBe(true);
+  });
+
+  it("suppresses bootstrap ownership for subagent and ACP/helper sessions", () => {
+    expect(isPrimaryBootstrapRun("agent:main:subagent:worker")).toBe(false);
+    expect(isPrimaryBootstrapRun("agent:main:acp:worker")).toBe(false);
+  });
+});
+
+describe("remapInjectedContextFilesToWorkspace", () => {
+  it("rewrites injected file paths onto the effective workspace when the tool root changes", () => {
+    expect(
+      remapInjectedContextFilesToWorkspace({
+        files: [
+          {
+            path: "/real/workspace/AGENTS.md",
+            content: "agents",
+          },
+          {
+            path: "/real/workspace/nested/TOOLS.md",
+            content: "tools",
+          },
+          {
+            path: "/outside/README.md",
+            content: "outside",
+          },
+        ],
+        sourceWorkspaceDir: "/real/workspace",
+        targetWorkspaceDir: "/sandbox/workspace",
+      }),
+    ).toEqual([
+      {
+        path: "/sandbox/workspace/AGENTS.md",
+        content: "agents",
+      },
+      {
+        path: "/sandbox/workspace/nested/TOOLS.md",
+        content: "tools",
+      },
+      {
+        path: "/outside/README.md",
+        content: "outside",
+      },
+    ]);
+  });
+});
+
 describe("shouldWarnOnOrphanedUserRepair", () => {
   it("warns for user and manual runs", () => {
     expect(shouldWarnOnOrphanedUserRepair("user")).toBe(true);
@@ -244,6 +371,7 @@ describe("mergeOrphanedTrailingUserPrompt", () => {
       }),
     ).toEqual({
       merged: true,
+      removeLeaf: true,
       prompt:
         "[Queued user message that arrived while the previous turn was still active]\n" +
         "older active-turn message\n\nnewest inbound message",
@@ -261,11 +389,124 @@ describe("mergeOrphanedTrailingUserPrompt", () => {
       }),
     ).toEqual({
       merged: false,
+      removeLeaf: true,
       prompt: "summary\nolder active-turn message\nnewest inbound message",
     });
   });
 
-  it("skips orphan prompt merging for non-user triggers", () => {
+  it("does not treat short orphan text as duplicate from a substring match", () => {
+    expect(
+      mergeOrphanedTrailingUserPrompt({
+        prompt: "please inspect this token",
+        trigger: "user",
+        leafMessage: {
+          content: "ok",
+        } as never,
+      }),
+    ).toEqual({
+      merged: true,
+      removeLeaf: true,
+      prompt:
+        "[Queued user message that arrived while the previous turn was still active]\n" +
+        "ok\n\nplease inspect this token",
+    });
+  });
+
+  it("preserves structured orphaned user content before removing the leaf", () => {
+    expect(
+      mergeOrphanedTrailingUserPrompt({
+        prompt: "newest inbound message",
+        trigger: "user",
+        leafMessage: {
+          content: [
+            { type: "text", text: "please inspect this" },
+            { type: "image_url", image_url: { url: "https://example.test/cat.png" } },
+            { type: "input_audio", audio_url: "https://example.test/cat.wav" },
+          ],
+        } as never,
+      }),
+    ).toEqual({
+      merged: true,
+      removeLeaf: true,
+      prompt:
+        "[Queued user message that arrived while the previous turn was still active]\n" +
+        "please inspect this\n" +
+        "[image_url] https://example.test/cat.png\n" +
+        "[input_audio] https://example.test/cat.wav\n\n" +
+        "newest inbound message",
+    });
+  });
+
+  it("summarizes inline structured media without embedding data URIs", () => {
+    const dataUri = `data:image/png;base64,${"a".repeat(4096)}`;
+
+    const result = mergeOrphanedTrailingUserPrompt({
+      prompt: "newest inbound message",
+      trigger: "user",
+      leafMessage: {
+        content: [
+          { type: "text", text: "please inspect this inline image" },
+          { type: "image_url", image_url: { url: dataUri } },
+        ],
+      } as never,
+    });
+
+    expect(result).toMatchObject({
+      merged: true,
+      removeLeaf: true,
+    });
+    expect(result.prompt).toContain("please inspect this inline image");
+    expect(result.prompt).toContain("[image_url] inline data URI (image/png, 4118 chars)");
+    expect(result.prompt).not.toContain("base64");
+    expect(result.prompt).not.toContain("aaaa");
+  });
+
+  it("summarizes unknown structured data before JSON serialization", () => {
+    const dataUri = `data:image/png;base64,${"a".repeat(10_000)}`;
+    const result = mergeOrphanedTrailingUserPrompt({
+      prompt: "newest inbound message",
+      trigger: "user",
+      leafMessage: {
+        content: [
+          {
+            type: "unknown_content",
+            nested: {
+              inline: dataUri,
+              longText: "b".repeat(2_000),
+            },
+          },
+        ],
+      } as never,
+    });
+
+    expect(result).toMatchObject({
+      merged: true,
+      removeLeaf: true,
+    });
+    expect(result.prompt).toContain("[value] inline data URI (image/png, 10022 chars)");
+    expect(result.prompt).toContain("bbbb");
+    expect(result.prompt).toContain("(2000 chars)");
+    expect(result.prompt).not.toContain("base64");
+    expect(result.prompt).not.toContain("aaaa");
+  });
+
+  it("removes an empty orphaned user leaf to prevent consecutive user turns", () => {
+    expect(
+      mergeOrphanedTrailingUserPrompt({
+        prompt: "newest inbound message",
+        trigger: "user",
+        leafMessage: {
+          content: [],
+        } as never,
+      }),
+    ).toEqual({
+      merged: false,
+      removeLeaf: true,
+      prompt: "newest inbound message",
+    });
+  });
+
+  it("merges orphan prompt text for non-user triggers without warning policy changes", () => {
     expect(
       mergeOrphanedTrailingUserPrompt({
         prompt: "HEARTBEAT_OK",
@@ -275,8 +516,11 @@ describe("mergeOrphanedTrailingUserPrompt", () => {
         } as never,
       }),
     ).toEqual({
-      merged: false,
-      prompt: "HEARTBEAT_OK",
+      merged: true,
+      removeLeaf: true,
+      prompt:
+        "[Queued user message that arrived while the previous turn was still active]\n" +
+        "older active-turn message\n\nHEARTBEAT_OK",
     });
   });
 });
@@ -424,19 +668,31 @@ describe("resolveAttemptFsWorkspaceOnly", () => {
 });
 
 describe("resolveUnknownToolGuardThreshold", () => {
-  it("returns undefined when loop detection is disabled", () => {
-    expect(resolveUnknownToolGuardThreshold({ enabled: false, unknownToolThreshold: 4 })).toBe(
-      undefined,
-    );
-    expect(resolveUnknownToolGuardThreshold(undefined)).toBe(undefined);
+  it("returns the default threshold when no loop-detection config is provided", () => {
+    expect(resolveUnknownToolGuardThreshold(undefined)).toBe(10);
+    expect(resolveUnknownToolGuardThreshold({})).toBe(10);
   });
 
-  it("uses the default threshold when loop detection is enabled without an override", () => {
-    expect(resolveUnknownToolGuardThreshold({ enabled: true })).toBe(10);
+  it("stays on even when tools.loopDetection.enabled is false (safety net)", () => {
+    // The unknown-tool guard has no false-positive surface — the tool is
+    // objectively not registered — so it is always on regardless of the
+    // opt-in genericRepeat/pingPong/pollNoProgress detectors.
+    expect(resolveUnknownToolGuardThreshold({ enabled: false })).toBe(10);
+    expect(resolveUnknownToolGuardThreshold({ enabled: false, unknownToolThreshold: 3 })).toBe(3);
   });
 
   it("uses the configured threshold override when provided", () => {
     expect(resolveUnknownToolGuardThreshold({ enabled: true, unknownToolThreshold: 4 })).toBe(4);
+  });
+
+  it("falls back to the default threshold when the override is non-positive", () => {
+    expect(resolveUnknownToolGuardThreshold({ unknownToolThreshold: 0 })).toBe(10);
+    expect(resolveUnknownToolGuardThreshold({ unknownToolThreshold: -5 })).toBe(10);
+    expect(resolveUnknownToolGuardThreshold({ unknownToolThreshold: Number.NaN })).toBe(10);
+  });
+
+  it("floors fractional overrides", () => {
+    expect(resolveUnknownToolGuardThreshold({ unknownToolThreshold: 3.7 })).toBe(3);
   });
 });
 
@@ -1725,9 +1981,11 @@ describe("wrapStreamFnSanitizeMalformedToolCalls", () => {
     );
 
     const wrapped = wrapStreamFnSanitizeMalformedToolCalls(baseFn as never, new Set(["read"]));
-    const stream = wrapped({ api: "google-gemini" } as never, { messages } as never, {} as never) as
-      | FakeWrappedStream
-      | Promise<FakeWrappedStream>;
+    const stream = wrapped(
+      { api: "google-gemini" } as never,
+      { messages } as never,
+      {} as never,
+    ) as FakeWrappedStream | Promise<FakeWrappedStream>;
     await Promise.resolve(stream);
 
     expect(baseFn).toHaveBeenCalledTimes(1);
@@ -2817,6 +3075,15 @@ describe("buildAfterTurnRuntimeContext", () => {
     });
   });
   it("includes resolved auth profile fields for context-engine afterTurn compaction", () => {
+    const promptCache = buildContextEnginePromptCacheInfo({
+      lastCallUsage: {
+        input: 10,
+        output: 5,
+        cacheRead: 40,
+        cacheWrite: 2,
+        total: 57,
+      },
+    });
     const legacy = buildAfterTurnRuntimeContext({
       attempt: {
         sessionKey: "agent:main:session:abc",
@@ -2837,7 +3104,8 @@ describe("buildAfterTurnRuntimeContext", () => {
       workspaceDir: "/tmp/workspace",
       agentDir: "/tmp/agent",
       tokenBudget: 1050000,
-      currentTokenCount: 232393,
+      currentTokenCount: 52,
+      promptCache,
     });
 
     expect(legacy).toMatchObject({
@@ -2847,7 +3115,55 @@ describe("buildAfterTurnRuntimeContext", () => {
       workspaceDir: "/tmp/workspace",
       agentDir: "/tmp/agent",
       tokenBudget: 1050000,
-      currentTokenCount: 232393,
+      currentTokenCount: 52,
+      promptCache: {
+        lastCallUsage: {
+          total: 57,
+        },
+      },
+    });
+  });
+
+  it("derives afterTurn token count from the current assistant usage snapshot", () => {
+    const lastCallUsage = {
+      input: 10,
+      output: 5,
+      cacheRead: 40,
+      cacheWrite: 2,
+      total: 57,
+    };
+    const promptCache = buildContextEnginePromptCacheInfo({ lastCallUsage });
+    const legacy = buildAfterTurnRuntimeContextFromUsage({
+      attempt: {
+        sessionKey: "agent:main:session:abc",
+        messageChannel: "slack",
+        messageProvider: "slack",
+        agentAccountId: "acct-1",
+        authProfileId: "openai:p1",
+        config: { plugins: { slots: { contextEngine: "lossless-claw" } } } as OpenClawConfig,
+        skillsSnapshot: undefined,
+        senderIsOwner: true,
+        provider: "openai-codex",
+        modelId: "gpt-5.4",
+        thinkLevel: "off",
+        reasoningLevel: "on",
+        extraSystemPrompt: "extra",
+        ownerNumbers: ["+15555550123"],
+      },
+      workspaceDir: "/tmp/workspace",
+      agentDir: "/tmp/agent",
+      tokenBudget: 1050000,
+      lastCallUsage,
+      promptCache,
+    });
+
+    expect(legacy).toMatchObject({
+      currentTokenCount: 52,
+      promptCache: {
+        lastCallUsage: {
+          total: 57,
+        },
+      },
     });
   });
 
