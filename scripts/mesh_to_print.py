@@ -119,6 +119,24 @@ def _surface_repair(mesh) -> tuple:
     return mesh, report
 
 
+def _skimage_available() -> bool:
+    try:
+        import skimage  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _require_skimage(what: str):
+    if not _skimage_available():
+        raise SystemExit(
+            f"{what} needs scikit-image for marching cubes.\n"
+            "  python3 -m pip install -r requirements-pipeline.txt  "
+            "(includes scikit-image)"
+        )
+
+
 def _voxel_remesh(mesh, voxel_size: float, origin: np.ndarray | None = None):
     """Solidify every component on a shared voxel lattice (blender-free weld).
 
@@ -126,14 +144,22 @@ def _voxel_remesh(mesh, voxel_size: float, origin: np.ndarray | None = None):
     common lattice so overlapping parts can never leave interior voxels
     behind (the classic "z-fighting" failure of BRep boolean engines).
     """
+    _require_skimage("voxel remesh")
     from trimesh.voxel import ops as vops
 
+    if mesh.bounds is None or not mesh.bounds.shape == (2, 3):
+        raise SystemExit("cannot voxel-remesh an empty/degenerate mesh")
     bounds = mesh.bounds
     if origin is None:
         origin = bounds[0]
     pitch = float(voxel_size)
     span = (bounds[1] - bounds[0]) / pitch
     dims = tuple(int(np.ceil(s)) for s in span)
+    if min(dims) < 1:
+        raise SystemExit(
+            f"voxel size {voxel_size} is too coarse for a mesh of extents "
+            f"{bounds[1] - bounds[0]}; pick a sub-unit size"
+        )
     # one extra slab so the shell fully encloses the part
     dims = tuple(d + 1 for d in dims)
 

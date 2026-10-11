@@ -53,26 +53,67 @@ log = logging.getLogger("anime_3dprint")
 STAGES = ("recon", "backgrid", "silhouette", "extrude", "weld", "repair", "export")
 
 
+def _importable(module: str) -> bool:
+    try:
+        __import__(module)
+        return True
+    except ImportError:
+        return False
+
+
+def _skimage_available() -> bool:
+    try:
+        import skimage  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+def _rembg_available() -> bool:
+    try:
+        import rembg  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # stage 0 -- environment recon
 # ---------------------------------------------------------------------------
 def _run_recon(cfg, ctx):
-    import trimesh  # noqa: F401
+    """Probe the pipeline runtime and report what the stages will use.
+
+    numpy / scipy / trimesh / Pillow / scikit-image are required (skimage
+    powers the voxel boolean weld and the repair fallback). rembg and blender
+    are optional quality boosts the stages degrade without.
+    """
+    hard = {
+        "numpy": "numpy",
+        "scipy": "scipy",
+        "trimesh": "trimesh",
+        "PIL": "Pillow",
+        "skimage": "scikit-image",
+    }
+    missing = [name for mod, name in hard.items() if not _importable(mod)]
+    if missing:
+        raise SystemExit(
+            "missing pipeline runtime deps: "
+            + ", ".join(missing)
+            + "\n  python3 -m pip install -r requirements-pipeline.txt"
+        )
+
+    import trimesh
 
     report = {
         "python": sys.version.split()[0],
+        "numpy": np.__version__,
         "trimesh": trimesh.__version__,
-        "rembg": bool(shutil.which("rembg")),
+        "scikit_image": _skimage_available(),
+        "rembg": _rembg_available(),
         "blender": bool(shutil.which("blender")),
     }
-    try:
-        from trimesh.voxel import ops  # noqa: F401
-
-        report["marching_cubes"] = True
-    except ImportError:
-        report["marching_cubes"] = False
-    if not report["marching_cubes"]:
-        raise SystemExit("scikit-image is required for voxel welding")
     return report
 
 
@@ -147,6 +188,34 @@ def _silhouette_random_walker(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
     return mask
 
 
+def _silhouette_color_threshold(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """numpy-only fallback: mark pixels far from the border color.
+
+    Keeps the pipeline headless-runnable (and the self-test deterministic)
+    on a box without scikit-image; Random-Walker is still preferred when the
+    wheel is installed.
+    """
+    color = _bg_dominant_color(rgb)
+    dist = np.sqrt(((rgb - color) ** 2).sum(axis=2))
+    tol = max(
+        18.0,
+        float(np.percentile(dist, 75)) * 0.5,
+        float(np.percentile(dist[alpha > 0], 95)) * 0.65,
+    )
+    mask = dist > tol
+    mask &= alpha > 0
+    return mask
+
+
+def _silhouette_mask(rgb: np.ndarray, alpha: np.ndarray, use_rembg: bool, cfg):
+    """Choose a masker: rembg, else sklearn-free Random-Walker / threshold."""
+    if use_rembg and _rembg_available():
+        return _silhouette_rembg(rgb, cfg)
+    if _skimage_available():
+        return _silhouette_random_walker(rgb, alpha)
+    return _silhouette_color_threshold(rgb, alpha)
+
+
 def _silhouette_rembg(rgb: np.ndarray, cfg) -> np.ndarray:
     """Mask from rembg when installed (best on busy backgrounds)."""
     import rembg  # type: ignore
@@ -170,11 +239,9 @@ def _run_silhouette(cfg, ctx):
     rgb, alpha = arr[:, :, :3].astype(float), arr[:, :, 3].astype(float)
 
     use_rembg = cfg.get("bg_remover", "auto") == "rembg" or (
-        cfg.get("bg_remover", "auto") == "auto" and shutil.which("rembg")
+        cfg.get("bg_remover", "auto") == "auto" and _rembg_available()
     )
-    mask = _silhouette_rembg(rgb, cfg) if use_rembg else _silhouette_random_walker(
-        rgb, alpha
-    )
+    mask = _silhouette_mask(rgb, alpha, use_rembg, cfg)
     # morphological cleanup: keep largest connected region, close small gaps
     from scipy import ndimage
 
@@ -325,7 +392,14 @@ def _run_weld(cfg, ctx):
 
 
 def _boolean_union(a, b, cfg):
-    """Union a and b.  Blender exact first, voxel lattice as fallback."""
+    """Union a and b.  Blender exact first, voxel lattice as fallback.
+
+    The voxel path is analytical: the figure is sampled as solid columns from
+    its silhouette depth field (O(cells), no per-point ray queries) and the
+    base as a cylinder, then unioned on a shared lattice and re-meshed with
+    marching cubes.  Marching cubes needs scikit-image, so a missing wheel is
+    a clean actionable error rather than a silent non-manifold shell.
+    """
     if cfg.get("use_blender"):
         try:
             import trimesh.interfaces.blender as tb  # type: ignore
@@ -335,9 +409,14 @@ def _boolean_union(a, b, cfg):
                 return {"mesh": u, "strategy": "blender"}
         except Exception:
             pass
-    # voxel weld on a shared lattice
+    if not _skimage_available():
+        raise SystemExit(
+            "voxel boolean weld needs scikit-image for marching cubes.\n"
+            "  python3 -m pip install -r requirements-pipeline.txt  "
+            "(includes scikit-image)"
+        )
     pitch = _voxel_pitch([a, b], cfg)
-    solid = _voxel_union([a, b], pitch)
+    solid = _voxel_union([a, b], cfg, pitch)
     return {"mesh": solid, "strategy": "voxel", "voxel_size": pitch}
 
 
@@ -351,30 +430,60 @@ def _voxel_pitch(meshes, cfg, cap_voxels: int = 120_000) -> float:
     bounds = np.vstack([m.bounds for m in meshes])
     extent = bounds[1::2, :].max(axis=0) - bounds[::2, :].min(axis=0)
     span = float(np.max(extent))
-    # default 1/200 of the largest extent, but never blow the voxel budget
-    pitch = span / 200.0
+    # default 1/100 of the largest extent (fine enough to keep thin figure
+    # columns connected), but never blow the voxel budget
+    pitch = span / 100.0
     cells = float((extent / pitch).prod())
     if cells > cap_voxels:
         pitch = float(np.cbrt(float(extent.prod()) / cap_voxels))
     return pitch
 
 
-def _voxel_union(meshes, pitch: float):
+def _voxel_union(meshes, cfg, pitch: float):
+    """Voxelize the union of closed solids onto a shared lattice.
+
+    ``meshes`` is the (figure, base) pair.  The figure is a heightfield solid
+    whose interior is exactly its silhouette columns, so occupancy is built
+    directly from the mask + depth field (fast, O(cells)); the base is a
+    cylinder sampled by radius.  This avoids the per-point ``mesh.contains``
+    ray storm that was both slow and fragmented thin figure geometry.
+    """
+    from PIL import Image
     from trimesh.voxel import ops as vops
 
+    fig, base = meshes
     bounds = np.vstack([m.bounds for m in meshes])
     origin = bounds[::2, :].min(axis=0)
     top = bounds[1::2, :].max(axis=0)
-    span = (top - origin) / pitch
-    dims = tuple(int(np.ceil(s)) + 1 for s in span)
+    extent = top - origin
+    dims = tuple(int(np.ceil(s)) + 1 for s in extent / pitch)
     xs = origin[0] + (np.arange(dims[0]) + 0.5) * pitch
     ys = origin[1] + (np.arange(dims[1]) + 0.5) * pitch
     zs = origin[2] + (np.arange(dims[2]) + 0.5) * pitch
     gx, gy, gz = np.meshgrid(xs, ys, zs, indexing="ij")
-    points = np.column_stack([gx.ravel(), gy.ravel(), gz.ravel()])
-    occupancy = np.zeros(dims, dtype=np.int8)
-    for m in meshes:
-        occupancy |= m.contains(points).reshape(dims).astype(np.int8)
+
+    # base: cylinder interior by radius test (primitive attrs on trimesh 5.x)
+    cx, cy, _ = fig.bounds.mean(axis=0)
+    base_r = float(getattr(base.primitive, "radius", 0.6))
+    base_occ = ((gx - cx) ** 2 + (gy - cy) ** 2 <= base_r * base_r) & (
+        gz >= base.bounds[0, 2]
+    ) & (gz <= base.bounds[1, 2])
+
+    # figure: solid columns from the silhouette depth field
+    mask_img = (
+        Image.open(Path(cfg["work"]) / "02_mask.png")
+        .convert("L")
+        .resize((cfg.get("mesh_resolution", 256),) * 2, Image.LANCZOS)
+    )
+    mask = np.asarray(mask_img) > 128
+    depth = _depth_from_mask(mask, cfg)
+    h, w = depth.shape
+    # mesh x -> mask column j, mesh y -> mask row i (see _run_extrude)
+    mi = np.clip(np.round(gy * (h - 1)).astype(int), 0, h - 1)
+    mj = np.clip(np.round(gx * (w - 1)).astype(int), 0, w - 1)
+    fig_occ = mask[mi, mj] & (gz >= 0) & (gz <= depth[mi, mj])
+
+    occupancy = (base_occ | fig_occ).astype(np.int8)
     solid = vops.matrix_to_marching_cubes(occupancy, pitch=pitch)
     solid.update_faces(solid.nondegenerate_faces())
     solid.apply_translation(origin)
@@ -396,9 +505,14 @@ def _run_repair(cfg, ctx):
     mesh.remove_unreferenced_vertices()
     if not mesh.is_watertight:
         log.warning("repair left open borders; running voxel solidify")
-        pitch = _voxel_pitch([mesh], cfg)
+        if not _skimage_available():
+            raise SystemExit(
+                "voxel solidify needs scikit-image: "
+                "python3 -m pip install -r requirements-pipeline.txt"
+            )
         from trimesh.voxel import ops as vops
 
+        pitch = _voxel_pitch([mesh], cfg)
         bounds = mesh.bounds
         origin, top = bounds[0], bounds[1]
         span = (top - origin) / pitch

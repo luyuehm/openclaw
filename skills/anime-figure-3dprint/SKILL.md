@@ -31,23 +31,35 @@ an optional quality boost).
 
 Stages run headless and write a JSON manifest into `<input>.work/manifest.json`:
 
-1. `recon`      — verify Python deps (trimesh, scikit-image, numpy, rtree).
+1. `recon`      — probe runtime deps (numpy, scipy, trimesh, Pillow,
+   scikit-image required; rembg / blender optional, reported in the manifest).
 2. `backgrid`   — square, padded, white/alpha-normalized canvas, size cap.
 3. `silhouette` — foreground mask. Uses `rembg` when installed; otherwise a
    local Random-Walker seeded by corner background colour (no model download).
+   With neither scikit-image nor rembg, degrades to a numpy-only border-color
+   threshold — always headless-runnable.
 4. `extrude`    — depth-from-silhouette (thicker for the torso, thinner for
    hair/limbs) -> closed heightfield mesh.
 5. `weld`       — print base (cylinder) boolean-unioned onto the figure.
-   Blender-free: overlapping parts are rasterised on a shared voxel lattice
-   and re-meshed with marching cubes, so intersecting geometry can never leave
-   non-manifold seams.
+   Blender-free: the figure is voxelized as solid silhouette columns (fast,
+   no per-point ray queries), unioned with the cylinder on a shared lattice,
+   and re-meshed with marching cubes, so intersecting geometry can never
+   leave non-manifold seams.  Needs scikit-image for marching cubes.
 6. `repair`     — watertightness gate; trimesh fill_holes/fix_normals, then a
-   voxel solidify fallback if the surface still leaks.
+   voxel solidify fallback (scikit-image) if the surface still leaks.
 7. `export`     — uniform millimetre scale (default 100 model units -> mm),
    binary STL, manifest.
 
 Preview PNGs (`01_backgrid.png`, `02_mask.png`) are written into the work dir
 so a human can inspect each stage even though the run is headless.
+
+## Setup
+
+```bash
+python3 -m pip install -r requirements-pipeline.txt   # required runtime
+# optional quality boost for busy-background silhouettes:
+python3 -m pip install rembg onnxruntime
+```
 
 ## Commands
 
@@ -104,10 +116,13 @@ Pass `--json` to print the manifest to stdout. The STL lands in
 - The image->mesh path is a 2.5D extrusion, not a full 3D reconstruction:
   good for chibi/statue silhouettes and sturdy print bases, not for
   articulated or undercut-heavy models.
-- `--bg-remover classic` (Random-Walker) works best on clean backgrounds;
-  busy scenes need `rembg`.
-- Voxel welding resolution is auto-capped (~120k cells) for memory; pass
-  `--voxel-size` to trade resolution for fidelity.
+- `silhouette` without rembg or scikit-image uses a border-color threshold:
+  it is deterministic and headless-runnable but less accurate on busy
+  backgrounds; install either optional wheel for better masks.
+- The voxel weld / solidify path requires scikit-image (marching cubes); the
+  scripts fail cleanly with an install hint when it is missing.  Voxel
+  resolution is auto-capped (~120k cells) for memory; pass `--voxel-size` to
+  trade resolution for fidelity.
 
 ## Safety
 

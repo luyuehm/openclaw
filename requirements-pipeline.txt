@@ -1,0 +1,18 @@
+# Anime figure 3D-print pipeline runtime deps (scripts/anime_3dprint_pipeline.py,
+# scripts/mesh_to_print.py).
+#
+# numpy/scipy/trimesh/Pillow/scikit-image are required: skimage powers the
+# voxel boolean weld and the voxel solidify repair path (marching cubes).
+# rembg is an optional quality boost for busy-background silhouettes; the
+# pipeline degrades gracefully to a border-color threshold when it is absent.
+
+numpy>=1.24
+scipy>=1.10
+trimesh>=4.0
+Pillow>=9.0
+scikit-image>=0.21
+rtree>=0.9
+
+# Optional (busy-background silhouettes):
+# rembg>=2.0
+# onnxruntime
